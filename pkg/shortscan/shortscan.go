@@ -2,7 +2,7 @@
 // Shortscan
 // An IIS short filename enumeration tool by bitquark
 // ------------------------------------------------------
-// Docs and code: https://github.com/bitquark/shortscan
+// Docs and code: https://github.com/aringo/shortscan
 // ------------------------------------------------------
 
 package shortscan

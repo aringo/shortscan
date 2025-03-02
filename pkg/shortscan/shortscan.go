@@ -8,26 +8,30 @@
 package shortscan
 
 import (
-	"os"
-	"fmt"
-	"sync"
-	"time"
 	"bufio"
-	"embed"
-	"regexp"
-	"strings"
-	"math/rand"
+	"context"
 	"crypto/tls"
+	"embed"
 	"encoding/json"
+	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httputil"
-	"github.com/fatih/color"
-	"github.com/alexflint/go-arg"
-	"github.com/bitquark/shortscan/pkg/maths"
-	"github.com/bitquark/shortscan/pkg/shortutil"
-	"github.com/bitquark/shortscan/pkg/levenshtein"
-	log "github.com/sirupsen/logrus"
 	nurl "net/url"
+	"os"
+	"os/signal"
+	"regexp"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/alexflint/go-arg"
+	"github.com/aringo/shortscan/pkg/levenshtein"
+	"github.com/aringo/shortscan/pkg/maths"
+	"github.com/aringo/shortscan/pkg/shortutil"
+	"github.com/fatih/color"
+	log "github.com/sirupsen/logrus"
 )
 
 type baseRequest struct {
@@ -109,7 +113,7 @@ type statsOutput struct {
 }
 
 // Version, rainbow table magic, default character set
-const version = "0.9.2"
+const version = "0.9.3"
 const rainbowMagic = "#SHORTSCAN#"
 const alphanum = "JFKGOTMYVHSPCANDXLRWEBQUIZ8549176320"
 
@@ -132,26 +136,26 @@ var pathSuffixes = [...]string{"/", "", "/.aspx", "?aspxerrorpath=/", "/.aspx?as
 var defaultWordlist embed.FS
 
 // Caches and regexes
-var statusCache map[string]map[int]struct{}
-var distanceCache map[string]map[int]distances
 var checksumRegex *regexp.Regexp
 
 // Command-line arguments and help
 type arguments struct {
-	Urls         []string `arg:"positional,required" help:"url to scan (multiple URLs can be provided; a file containing URLs can be specified with an «at» prefix, for example: @urls.txt)" placeholder:"URL"`
-	Wordlist     string   `arg:"-w" help:"combined wordlist + rainbow table generated with shortutil" placeholder:"FILE"`
-	Headers      []string `arg:"--header,-H,separate" help:"header to send with each request (use multiple times for multiple headers)"`
-	Concurrency  int      `arg:"-c" help:"number of requests to make at once" default:"20"`
-	Timeout      int      `arg:"-t" help:"per-request timeout in seconds" placeholder:"SECONDS" default:"10"`
-	Output       string   `arg:"-o" help:"output format (human = human readable; json = JSON)" placeholder:"format" default:"human"`
-	Verbosity    int      `arg:"-v" help:"how much noise to make (0 = quiet; 1 = debug; 2 = trace)" default:"0"`
-	FullUrl      bool     `arg:"-F" help:"display the full URL for confirmed files rather than just the filename" default:"false"`
-	NoRecurse    bool     `arg:"-n" help:"don't detect and recurse into subdirectories (disabled when autocomplete is disabled)" default:"false"`
-	Stabilise    bool     `arg:"-s" help:"attempt to get coherent autocomplete results from an unstable server (generates more requests)" default:"false"`
-	Patience     int      `arg:"-p" help:"patience level when determining vulnerability (0 = patient; 1 = very patient)" placeholder:"LEVEL" default:"0"`
-	Characters   string   `arg:"-C" help:"filename characters to enumerate" default:"JFKGOTMYVHSPCANDXLRWEBQUIZ8549176320-_()&'!#$%@^{}~"`
-	Autocomplete string   `arg:"-a" help:"autocomplete detection mode (auto = autoselect; method = HTTP method magic; status = HTTP status; distance = Levenshtein distance; none = disable)" placeholder:"mode" default:"auto"`
-	IsVuln       bool     `arg:"-V" help:"bail after determining whether the service is vulnerable" default:"false"`
+	Urls           []string `arg:"positional,required" help:"url to scan (multiple URLs can be provided; a file containing URLs can be specified with an «at» prefix, for example: @urls.txt)" placeholder:"URL"`
+	Wordlist       string   `arg:"-w" help:"combined wordlist + rainbow table generated with shortutil" placeholder:"FILE"`
+	Headers        []string `arg:"--header,-H,separate" help:"header to send with each request (use multiple times for multiple headers)"`
+	Concurrency    int      `arg:"-c" help:"number of requests to make at once" default:"20"`
+	Timeout        int      `arg:"-t" help:"per-request timeout in seconds" placeholder:"SECONDS" default:"10"`
+	Output         string   `arg:"-o" help:"output format (human = human readable; json = JSON)" placeholder:"format" default:"human"`
+	Verbosity      int      `arg:"-v" help:"how much noise to make (0 = quiet; 1 = debug; 2 = trace)" default:"0"`
+	FullUrl        bool     `arg:"-F" help:"display the full URL for confirmed files rather than just the filename" default:"false"`
+	NoRecurse      bool     `arg:"-n" help:"don't detect and recurse into subdirectories (disabled when autocomplete is disabled)" default:"false"`
+	Stabilise      bool     `arg:"-s" help:"attempt to get coherent autocomplete results from an unstable server (generates more requests)" default:"false"`
+	Patience       int      `arg:"-p" help:"patience level when determining vulnerability (0 = patient; 1 = very patient)" placeholder:"LEVEL" default:"0"`
+	Characters     string   `arg:"-C" help:"filename characters to enumerate" default:"JFKGOTMYVHSPCANDXLRWEBQUIZ8549176320-_()&'!#$%@^{}~"`
+	Autocomplete   string   `arg:"-a" help:"autocomplete detection mode (auto = autoselect; method = HTTP method magic; status = HTTP status; distance = Levenshtein distance; none = disable)" placeholder:"mode" default:"auto"`
+	IsVuln         bool     `arg:"-V" help:"bail after determining whether the service is vulnerable" default:"false"`
+	UrlConcurrency int      `arg:"--url-concurrency,-M" help:"number of URLs to scan concurrently" default:"1"`
+	BatchSize      int      `arg:"--batch-size" help:"number of URLs to process in each batch" default:"100"`
 }
 
 func (arguments) Version() string {
@@ -253,7 +257,15 @@ func fetch(hc *http.Client, st *httpStats, method string, url string) (*http.Res
 }
 
 // enumerate builds and fetches candidate short name URLs making use of recursion
-func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpStats, ac *attackConfig, mk markers, br baseRequest) {
+func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpStats, ac *attackConfig, mk markers, br baseRequest, statusCache map[string]map[int]struct{}, distanceCache map[string]map[int]distances) {
+
+	// Initialize the maps if they're nil
+	if statusCache == nil {
+		statusCache = make(map[string]map[int]struct{})
+	}
+	if distanceCache == nil {
+		distanceCache = make(map[string]map[int]distances)
+	}
 
 	// Extension enumeration mode
 	extMode := len(br.ext) > 0
@@ -273,7 +285,7 @@ func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpS
 		wg.Add(1)
 
 		// Check goroutine
-		go func(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, ac *attackConfig, mk markers, br baseRequest, char string) {
+		go func(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, ac *attackConfig, mk markers, br baseRequest, char string, statusCache map[string]map[int]struct{}, distanceCache map[string]map[int]distances) {
 
 			// Waitgroup and semaphore handling
 			sem <- struct{}{}
@@ -378,7 +390,7 @@ func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpS
 									} else if args.Autocomplete == "status" {
 
 										// Check the response doesn't appear in this candidate's negative status set
-										ss := getStatuses(c, br, hc, st)
+										ss := getStatuses(c, br, hc, st, statusCache)
 
 										if _, e := ss[res.StatusCode]; !e {
 											fnr = path
@@ -387,7 +399,7 @@ func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpS
 									} else if args.Autocomplete == "distance" {
 
 										// Get distances for this candidate
-										dists := getDistances(c, br, hc, st, ac)
+										dists := getDistances(c, br, hc, st, ac, distanceCache)
 
 										// If the status code wasn't seen during sampling
 										if dists[res.StatusCode] == (distances{}) {
@@ -517,7 +529,7 @@ func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpS
 					if len(br.ext) == 0 {
 						nr := br
 						nr.ext = "."
-						enumerate(sem, wg, hc, st, ac, mk, nr)
+						enumerate(sem, wg, hc, st, ac, mk, nr, statusCache, distanceCache)
 					}
 
 				}
@@ -536,14 +548,14 @@ func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpS
 					// Recurse if there are more characters in the name
 					res, err = fetch(hc, st, ac.method, url)
 					if err == nil && res.StatusCode != mk.statusNeg {
-						enumerate(sem, wg, hc, st, ac, mk, br)
+						enumerate(sem, wg, hc, st, ac, mk, br, statusCache, distanceCache)
 					}
 
 				}
 
 			}
 
-		}(sem, wg, hc, ac, mk, br, string(char))
+		}(sem, wg, hc, ac, mk, br, string(char), statusCache, distanceCache)
 
 	}
 
@@ -624,11 +636,22 @@ func autodechecksum(ac *attackConfig, br baseRequest) []wordlistRecord {
 }
 
 // getStatuses fetches non-existent URLs and returns a list of response statuses
-func getStatuses(c wordlistRecord, br baseRequest, hc *http.Client, st *httpStats) map[int]struct{} {
+func getStatuses(c wordlistRecord, br baseRequest, hc *http.Client, st *httpStats, statusCache map[string]map[int]struct{}) map[int]struct{} {
+
+	// Create a local map if the passed map is nil
+	localCache := statusCache
+	if localCache == nil {
+		localCache = make(map[string]map[int]struct{})
+	}
+
+	// Initialize the inner map if it doesn't exist
+	if localCache[c.extension] == nil {
+		localCache[c.extension] = make(map[int]struct{})
+	}
 
 	// Returned cached statuses if they exist
-	if len(statusCache[c.extension]) > 0 {
-		return statusCache[c.extension]
+	if len(localCache[c.extension]) > 0 {
+		return localCache[c.extension]
 	}
 
 	// Set loop count based on stability
@@ -655,21 +678,27 @@ func getStatuses(c wordlistRecord, br baseRequest, hc *http.Client, st *httpStat
 	log.WithFields(log.Fields{"extension": c.extension, "statuses": statuses}).Info("Got non-existent file statuses")
 
 	// Cache and return the statuses
-	statusCache[c.extension] = statuses
+	localCache[c.extension] = statuses
 	return statuses
-
 }
 
 // getDistances calculates response distances for the given URL
-func getDistances(c wordlistRecord, br baseRequest, hc *http.Client, st *httpStats, ac *attackConfig) map[int]distances {
+func getDistances(c wordlistRecord, br baseRequest, hc *http.Client, st *httpStats, ac *attackConfig, distanceCache map[string]map[int]distances) map[int]distances {
 
-	// Lock the mutex
-	ac.distanceMutex.Lock()
-	defer ac.distanceMutex.Unlock()
+	// Create a local map if the passed map is nil
+	localCache := distanceCache
+	if localCache == nil {
+		localCache = make(map[string]map[int]distances)
+	}
+
+	// Initialize the inner map if it doesn't exist
+	if localCache[c.extension] == nil {
+		localCache[c.extension] = make(map[int]distances)
+	}
 
 	// Return distances if cached
-	if len(distanceCache[c.extension]) > 0 {
-		return distanceCache[c.extension]
+	if len(localCache[c.extension]) > 0 {
+		return localCache[c.extension]
 	}
 
 	// Status
@@ -726,7 +755,7 @@ func getDistances(c wordlistRecord, br baseRequest, hc *http.Client, st *httpSta
 	}
 
 	// Cache and return
-	distanceCache[c.extension] = dists
+	localCache[c.extension] = dists
 	return dists
 
 }
@@ -734,16 +763,16 @@ func getDistances(c wordlistRecord, br baseRequest, hc *http.Client, st *httpSta
 // getWordlist returns wordlist entries
 func getWordlist(ch chan wordlistRecord, ac *attackConfig) {
 
-	// Lock the wordlist
+	// Create a copy of the wordlist to avoid long locks
 	ac.wordlist.Lock()
+	wordlistCopy := make([]wordlistRecord, len(ac.wordlist.wordlist))
+	copy(wordlistCopy, ac.wordlist.wordlist)
+	ac.wordlist.Unlock()
 
-	// Return each word
-	for _, record := range ac.wordlist.wordlist {
+	// Send each word through the channel
+	for _, record := range wordlistCopy {
 		ch <- record
 	}
-
-	// Unlock the wordlist and close the channel
-	ac.wordlist.Unlock()
 	close(ch)
 
 }
@@ -762,8 +791,12 @@ func randPath(l int, d int, chars string) string {
 }
 
 // printHuman prints human readable output if enabled
+var outputMutex sync.Mutex
+
 func printHuman(s ...any) {
 	if args.Output == "human" {
+		outputMutex.Lock()
+		defer outputMutex.Unlock()
 		fmt.Println(s...)
 	}
 }
@@ -771,13 +804,23 @@ func printHuman(s ...any) {
 // printJSON prints JSON formatted output if enabled
 func printJSON(o any) {
 	if args.Output == "json" {
+		outputMutex.Lock()
+		defer outputMutex.Unlock()
 		j, _ := json.Marshal(o)
 		fmt.Println(string(j))
 	}
 }
 
 // Scan starts enumeration of the given URL
-func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk markers) {
+func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk markers, statusCache map[string]map[int]struct{}, distanceCache map[string]map[int]distances) {
+
+	// Initialize the maps if they're nil
+	if statusCache == nil {
+		statusCache = make(map[string]map[int]struct{})
+	}
+	if distanceCache == nil {
+		distanceCache = make(map[string]map[int]distances)
+	}
 
 	// Loop through each URL
 	for len(urls) > 0 {
@@ -798,13 +841,15 @@ func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk m
 
 		// Validate the URL
 		if _, err := nurl.Parse(url); err != nil {
-			log.WithFields(log.Fields{"url": url, "error": err}).Fatal("Unable to parse URL")
+			log.WithFields(log.Fields{"url": url, "error": err}).Error("Unable to parse URL")
+			return
 		}
 
 		// Grab some headers and make sure the URL is accessible
 		res, err := fetch(hc, st, "GET", url+".aspx")
 		if err != nil {
-			log.WithFields(log.Fields{"error": err}).Fatal("Unable to access server")
+			log.WithFields(log.Fields{"error": err}).Error("Unable to access server")
+			return
 		}
 
 		// Display server information
@@ -855,11 +900,11 @@ func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk m
 		}
 
 		// Loop through path suffixes
-		outerEscape:
+	outerEscape:
 		for _, suffix := range pathSuffixes[:pc] {
 
 			// Loop through each method
-			methodEscape:
+		methodEscape:
 			for _, method := range httpMethods[:mc] {
 
 				// Make some requests for non-existent files
@@ -1009,7 +1054,7 @@ func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk m
 
 		// Loop through the tilde pool
 		for _, tilde := range ac.tildes {
-			enumerate(sem, wg, hc, st, &ac, mk, baseRequest{url: url, file: "", tilde: tilde, ext: ""})
+			enumerate(sem, wg, hc, st, &ac, mk, baseRequest{url: url, file: "", tilde: tilde, ext: ""}, statusCache, distanceCache)
 		}
 		wg.Wait()
 
@@ -1021,6 +1066,10 @@ func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk m
 		// <hr>
 		printHuman("════════════════════════════════════════════════════════════════════════════════")
 
+		// Create local caches for this scan
+		localStatusCache := make(map[string]map[int]struct{})
+		localDistanceCache := make(map[string]map[int]distances)
+		Scan(urls, hc, st, wc, mk, localStatusCache, localDistanceCache)
 	}
 	printHuman()
 
@@ -1032,7 +1081,6 @@ func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk m
 
 // Run kicks off scans from the command line
 func Run() {
-
 	// First things first
 	rand.Seed(time.Now().UTC().UnixNano())
 
@@ -1050,10 +1098,8 @@ func Run() {
 	// Build the list of URLs to scan
 	var urls []string
 	for _, url := range args.Urls {
-
 		// If this is a filename rather than a URL
 		if strings.HasPrefix(url, "@") {
-
 			// Open the file
 			path := strings.TrimPrefix(url, "@")
 			fh, err := os.Open(path)
@@ -1065,27 +1111,27 @@ func Run() {
 			// Add each line to the URL list
 			sc := bufio.NewScanner(fh)
 			for sc.Scan() {
-				urls = append(urls, sc.Text())
+				line := strings.TrimSpace(sc.Text())
+				if line != "" && !strings.HasPrefix(line, "#") {
+					urls = append(urls, line)
+				}
 			}
 
 			// Check for file read errors
 			if err := sc.Err(); err != nil {
 				log.WithFields(log.Fields{"path": path, "err": err}).Fatal("Error reading URL list file")
 			}
-
 		} else {
-
 			// This is a plain URL, add it to the list
 			urls = append(urls, url)
-
 		}
-
 	}
 
 	// Say hello
 	printHuman(getBanner())
+	printHuman(fmt.Sprintf("Processing %d URLs with concurrency %d", len(urls), args.UrlConcurrency))
 
-	// Warn if any filename characters are invalid (https://docs.microsoft.com/en-us/windows/win32/fileio/naming-a-file)
+	// Warn if any filename characters are invalid
 	for _, c := range []string{"<", ">", ":", "\"", "/", "\\", "|", "?", "*"} {
 		if strings.Contains(args.Characters, c) {
 			log.WithFields(log.Fields{"character": c}).Warn("Invalid filename character; weird things may happen")
@@ -1105,23 +1151,6 @@ func Run() {
 		log.SetLevel(log.WarnLevel)
 	}
 
-	// Build an HTTP client
-	hc := &http.Client{
-		Timeout:       time.Duration(args.Timeout) * time.Second,
-		Transport:     &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, Renegotiation: tls.RenegotiateOnceAsClient}, Proxy: http.ProxyFromEnvironment},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
-	}
-
-	// Initialise things
-	mk := markers{}
-	st := &httpStats{}
-	wc := wordlistConfig{}
-	statusCache = make(map[string]map[int]struct{})
-	distanceCache = make(map[string]map[int]distances)
-
-	// Compile the checksum detection regex
-	checksumRegex = regexp.MustCompile(".{1,2}[0-9A-F]{4}")
-
 	// Select the wordlist
 	var s *bufio.Scanner
 	if args.Wordlist != "" {
@@ -1138,9 +1167,9 @@ func Run() {
 	}
 
 	// Read the wordlist into memory
+	wc := wordlistConfig{}
 	n := 0
 	for s.Scan() {
-
 		// Read the line
 		line := s.Text()
 
@@ -1158,7 +1187,6 @@ func Run() {
 
 		// Add the line to the wordlist
 		if wc.isRainbow {
-
 			// Check tab count
 			if strings.Count(line, "\t") != 4 {
 				log.WithFields(log.Fields{"line": line}).Fatal("Wordlist entry invalid (incorrect tab count)")
@@ -1172,9 +1200,7 @@ func Run() {
 				e = "." + e
 			}
 			wc.wordlist = append(wc.wordlist, wordlistRecord{c[0], f, e, f83, e83})
-
 		} else {
-
 			// Split the line into file and extension and generate an 8.3 version
 			var r wordlistRecord
 			if p := strings.LastIndex(line, "."); p > 0 && line[0] != '.' {
@@ -1186,15 +1212,148 @@ func Run() {
 				r = wordlistRecord{"", line, "", f83, ""}
 			}
 			wc.wordlist = append(wc.wordlist, r)
-
 		}
 
 		// Next
 		n += 1
-
 	}
 
-	// Let's go!
-	Scan(urls, hc, st, wc, mk)
+	// Compile the checksum detection regex
+	checksumRegex = regexp.MustCompile(".{1,2}[0-9A-F]{4}")
+
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		<-sigChan
+		printHuman("\nReceived interrupt signal. Gracefully shutting down...")
+		cancel()
+	}()
+
+	// Process URLs concurrently with a semaphore to limit concurrency
+	urlSem := make(chan struct{}, args.UrlConcurrency)
+	urlWg := new(sync.WaitGroup)
+
+	// Create a global stats aggregator
+	globalStats := &httpStats{}
+
+	// Track progress with timing
+	processedURLs := 0
+	totalURLs := len(urls)
+	progressMutex := &sync.Mutex{}
+	startTime := time.Now()
+
+	// Process all URLs concurrently, limited by the semaphore
+	for _, url := range urls {
+		// Check if we've been interrupted
+		select {
+		case <-ctx.Done():
+			goto cleanup
+		default:
+			// Continue processing
+		}
+
+		urlWg.Add(1)
+		go func(url string) {
+			defer urlWg.Done()
+
+			// Acquire semaphore slot
+			urlSem <- struct{}{}
+			defer func() { <-urlSem }()
+
+			// Update progress when done
+			defer func() {
+				progressMutex.Lock()
+				processedURLs++
+				if args.Output == "human" && processedURLs%10 == 0 {
+					elapsed := time.Since(startTime)
+					timePerURL := elapsed / time.Duration(processedURLs)
+					eta := timePerURL * time.Duration(totalURLs-processedURLs)
+					fmt.Printf("\rProgress: %d/%d URLs processed (%d%%) - ETA: %s",
+						processedURLs, totalURLs, (processedURLs*100)/totalURLs, eta.Round(time.Second))
+				}
+				progressMutex.Unlock()
+			}()
+
+			// Create a new HTTP client for each URL
+			urlHc := &http.Client{
+				Timeout: time.Duration(args.Timeout) * time.Second,
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						InsecureSkipVerify: true,
+						Renegotiation:      tls.RenegotiateOnceAsClient,
+					},
+					Proxy:               http.ProxyFromEnvironment,
+					MaxIdleConns:        100,
+					MaxIdleConnsPerHost: args.Concurrency,
+					IdleConnTimeout:     30 * time.Second,
+				},
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
+			}
+
+			// Create URL-specific stats
+			urlSt := &httpStats{}
+
+			// Create URL-specific caches to avoid race conditions
+			urlStatusCache := make(map[string]map[int]struct{})
+			urlDistanceCache := make(map[string]map[int]distances)
+
+			// Create URL-specific markers
+			urlMk := markers{}
+
+			// Improve URL timeout handling
+			timeoutMultiplier := 2
+			if args.Patience > 0 || args.Stabilise {
+				timeoutMultiplier = 5
+			}
+			urlCtx, urlCancel := context.WithTimeout(ctx, time.Duration(args.Timeout*timeoutMultiplier)*time.Second)
+			defer urlCancel()
+
+			// Check for timeout during scan
+			select {
+			case <-urlCtx.Done():
+				log.WithFields(log.Fields{"url": url}).Warn("URL scan timed out")
+				return
+			default:
+				// Create local caches for this scan
+				localStatusCache := make(map[string]map[int]struct{})
+				localDistanceCache := make(map[string]map[int]distances)
+				Scan([]string{url}, urlHc, urlSt, wc, urlMk, localStatusCache, localDistanceCache)
+			}
+
+			// Aggregate statistics
+			globalStats.Lock()
+			globalStats.requests += urlSt.requests
+			globalStats.retries += urlSt.retries
+			globalStats.bytesTx += urlSt.bytesTx
+			globalStats.bytesRx += urlSt.bytesRx
+			globalStats.Unlock()
+		}(url)
+	}
+
+	// Wait for all URLs to complete
+	urlWg.Wait()
+
+cleanup:
+	// Clear the progress line
+	if args.Output == "human" {
+		fmt.Print("\r                                                                \r")
+	}
+
+	// Output the aggregated statistics
+	printHuman(fmt.Sprintf("%s Requests: %d; Retries: %d; Sent %d bytes; Received %d bytes",
+		color.New(color.FgWhite, color.Bold).Sprint("Finished!"),
+		globalStats.requests, globalStats.retries, globalStats.bytesTx, globalStats.bytesRx))
+	printJSON(statsOutput{
+		Type:          "statistics",
+		Requests:      globalStats.requests,
+		Retries:       globalStats.retries,
+		SentBytes:     globalStats.bytesTx,
+		ReceivedBytes: globalStats.bytesRx,
+	})
 
 }

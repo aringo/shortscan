@@ -8,19 +8,20 @@
 package shortutil
 
 import (
-	"io"
-	"os"
+	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"math"
+	"net/url"
+	"os"
 	"path"
-	"bufio"
 	"regexp"
 	"strings"
-	"net/url"
-	"github.com/fatih/color"
+
 	"github.com/alexflint/go-arg"
-	"github.com/bitquark/shortscan/pkg/maths"
+	"github.com/aringo/shortscan/pkg/maths"
+	"github.com/fatih/color"
 )
 
 type wordlistRecord struct {
@@ -82,14 +83,14 @@ func ChecksumOriginal(f string) string {
 
 	var ck uint16
 	ck = (uint16(f[0])<<8 + uint16(f[1])) & 0xffff
-	for i := 2; i < len(f); i+=2 {
-		if ck & 1 == 1 {
+	for i := 2; i < len(f); i += 2 {
+		if ck&1 == 1 {
 			ck = 0x8000 + ck>>1 + uint16(f[i])<<8
 		} else {
 			ck = ck>>1 + uint16(f[i])<<8
 		}
-		if (i+1 < len(f)) {
-		    ck += uint16(f[i+1]) & 0xffff
+		if i+1 < len(f) {
+			ck += uint16(f[i+1]) & 0xffff
 		}
 	}
 
@@ -110,7 +111,7 @@ func Gen8dot3(file string, ext string) (bool, string, string) {
 	er := shortReplacer.Replace(eu)
 
 	// Determine whether a short filename was required
-	r := len(file) > 8 || len (ext) > 3 || fu != fr || eu != er
+	r := len(file) > 8 || len(ext) > 3 || fu != fr || eu != er
 
 	// Trim and return the names
 	return r, fr[:maths.Min(len(fr), 6)], er[:maths.Min(len(er), 3)]
@@ -139,7 +140,7 @@ func ChecksumWords(fh io.Reader, paramRegex *regexp.Regexp) []wordlistRecord {
 		// Split the file and extension
 		var f, e string
 		if p := strings.LastIndex(w, "."); p > 0 && w[0] != '.' {
-			f, e = w[:p], w[p + 1:]
+			f, e = w[:p], w[p+1:]
 		} else {
 			f, e = w, ""
 		}
@@ -181,7 +182,7 @@ func Run() {
 	// Parse command-line arguments
 	p := arg.MustParse(&args)
 	if p.Subcommand() == nil {
-		fmt.Println(color.New(color.FgBlue, color.Bold).Sprint("Shortutil v" + version), "·", color.New(color.FgWhite, color.Bold).Sprint("a short filename utility by bitquark"))
+		fmt.Println(color.New(color.FgBlue, color.Bold).Sprint("Shortutil v"+version), "·", color.New(color.FgWhite, color.Bold).Sprint("a short filename utility by bitquark"))
 		p.WriteHelp(os.Stderr)
 		os.Exit(1)
 	}

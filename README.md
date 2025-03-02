@@ -1,12 +1,12 @@
 # 🌀 Shortscan
 
-An IIS short filename enumeration tool.
+An IIS short filename enumeration tool with multi-URL scanning capabilities.
 
 ## Functionality
 
 Shortscan is designed to quickly determine which files with short filenames exist on an IIS webserver. Once a short filename has been identified the tool will try to automatically identify the full filename.
 
-In addition to standard discovery methods Shortscan also uses a unique checksum matching approach to attempt to find the long filename where the short filename is based on Windows' propriatary shortname collision avoidance checksum algorithm (more on this research at a later date).
+In addition to standard discovery methods Shortscan also uses a unique checksum matching approach to attempt to find the long filename where the short filename is based on Windows' proprietary shortname collision avoidance checksum algorithm.
 
 ## Installation
 
@@ -15,7 +15,7 @@ In addition to standard discovery methods Shortscan also uses a unique checksum 
 Using a recent version of [go](https://golang.org/):
 
 ```
-go install github.com/bitquark/shortscan/cmd/shortscan@latest
+go install github.com/aringo/shortscan/cmd/shortscan@latest
 ```
 
 ### Manual install
@@ -23,8 +23,10 @@ go install github.com/bitquark/shortscan/cmd/shortscan@latest
 To build (and optionally install) locally:
 
 ```
-go get && go build
-go install
+git clone https://github.com/aringo/shortscan.git
+cd shortscan
+go build ./cmd/shortscan
+go install ./cmd/shortscan
 ```
 
 ## Usage
@@ -34,13 +36,45 @@ go install
 Shortscan is easy to use with minimal configuration. Basic usage looks like:
 
 ```
-$ shortscan http://example.org/
+$ shortscan https://example.org/
 ```
+
+### Multiple URLs
+
+You can scan multiple URLs at once:
+
+```
+$ shortscan https://example1.com https://example2.com https://example3.com
+```
+
+### URL List from File
 
 You can also specify a file containing a list of URLs to be scanned:
 
 ```
 $ shortscan @urls.txt
+```
+
+The file can contain comments (lines starting with #) and empty lines, which will be ignored.
+
+### Concurrency Options
+
+```
+# Process 5 URLs concurrently
+shortscan -M 5 @urls.txt
+
+# Make 30 requests at once per URL
+shortscan -c 30 https://example.com
+
+# Combined URL and request concurrency
+shortscan -M 5 -c 30 @urls.txt
+```
+
+### Batch Processing
+
+```
+# Process URLs in batches of 50 (default is 100)
+shortscan --batch-size 50 @urls.txt
 ```
 
 ### Examples
@@ -60,8 +94,8 @@ shortscan --isvuln
 The following options allow further tweaks:
 
 ```
-🌀 Shortscan v0.9.2 · an IIS short filename enumeration tool by bitquark
-Usage: main [--wordlist FILE] [--header HEADER] [--concurrency CONCURRENCY] [--timeout SECONDS] [--output format] [--verbosity VERBOSITY] [--fullurl] [--norecurse] [--stabilise] [--patience LEVEL] [--characters CHARACTERS] [--autocomplete mode] [--isvuln] URL [URL ...]
+🌀 Shortscan v1.0.0 · an IIS short filename enumeration tool
+Usage: shortscan [--wordlist FILE] [--header HEADER] [--concurrency CONCURRENCY] [--timeout SECONDS] [--output format] [--verbosity VERBOSITY] [--fullurl] [--norecurse] [--stabilise] [--patience LEVEL] [--characters CHARACTERS] [--autocomplete mode] [--isvuln] [--url-concurrency URL-CONCURRENCY] [--batch-size BATCH-SIZE] URL [URL ...]
 
 Positional arguments:
   URL                    url to scan (multiple URLs can be provided; a file containing URLs can be specified with an «at» prefix, for example: @urls.txt)
@@ -89,6 +123,10 @@ Options:
   --autocomplete mode, -a mode
                          autocomplete detection mode (auto = autoselect; method = HTTP method magic; status = HTTP status; distance = Levenshtein distance; none = disable) [default: auto]
   --isvuln, -V           bail after determining whether the service is vulnerable [default: false]
+  --url-concurrency URL-CONCURRENCY, -M URL-CONCURRENCY
+                         number of URLs to scan concurrently [default: 1]
+  --batch-size BATCH-SIZE
+                         number of URLs to process in each batch [default: 100]
   --help, -h             display this help and exit
   --version              display version and exit
 ```
@@ -113,11 +151,11 @@ shortutil checksum index.html
 
 ### Usage
 
-Run `shortutil <command> --help` for a definiteive list of options for each command.
+Run `shortutil <command> --help` for a definitive list of options for each command.
 
 ```
-Shortutil v0.3 · a short filename utility by bitquark
-Usage: main <command> [<args>]
+Shortutil v0.4 · a short filename utility
+Usage: shortutil <command> [<args>]
 
 Options:
   --help, -h             display this help and exit
@@ -135,4 +173,6 @@ A custom wordlist was built for shortscan. For full details see [pkg/shortscan/r
 
 Original IIS short filename [research](https://soroush.secproject.com/downloadable/microsoft_iis_tilde_character_vulnerability_feature.pdf) by Soroush Dalili.
 
-Additional research and this project by [bitquark](https://github.com/bitquark).
+Additional research and original project by [bitquark](https://github.com/bitquark).
+
+Multi-URL scanning and concurrency improvements by [aringo](https://github.com/aringo).

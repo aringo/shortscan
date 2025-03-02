@@ -1,9 +1,10 @@
-module github.com/bitquark/shortscan
+module github.com/aringo/shortscan
 
 go 1.18
 
 require (
 	github.com/alexflint/go-arg v1.4.3
+	github.com/bitquark/shortscan v0.9.2
 	github.com/fatih/color v1.15.0
 	github.com/sirupsen/logrus v1.9.3
 )

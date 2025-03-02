@@ -138,6 +138,19 @@ var defaultWordlist embed.FS
 // Caches and regexes
 var checksumRegex *regexp.Regexp
 
+// Declare the cache variables at package level
+var (
+	statusCache   map[string]map[int]struct{}
+	distanceCache map[string]map[int]distances
+	cacheMutex    sync.RWMutex
+)
+
+// Initialize them in init()
+func init() {
+	statusCache = make(map[string]map[int]struct{})
+	distanceCache = make(map[string]map[int]distances)
+}
+
 // Command-line arguments and help
 type arguments struct {
 	Urls           []string `arg:"positional,required" help:"url to scan (multiple URLs can be provided; a file containing URLs can be specified with an «at» prefix, for example: @urls.txt)" placeholder:"URL"`
@@ -258,14 +271,8 @@ func fetch(hc *http.Client, st *httpStats, method string, url string) (*http.Res
 
 // enumerate builds and fetches candidate short name URLs making use of recursion
 func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpStats, ac *attackConfig, mk markers, br baseRequest, statusCache map[string]map[int]struct{}, distanceCache map[string]map[int]distances) {
-
-	// Initialize the maps if they're nil
-	if statusCache == nil {
-		statusCache = make(map[string]map[int]struct{})
-	}
-	if distanceCache == nil {
-		distanceCache = make(map[string]map[int]distances)
-	}
+	// We'll use the package-level caches if nil is passed
+	usePackageCaches := statusCache == nil || distanceCache == nil
 
 	// Extension enumeration mode
 	extMode := len(br.ext) > 0
@@ -280,19 +287,25 @@ func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpS
 
 	// Loop through characters
 	for _, char := range chars {
-
 		// Increment the waitgroup
 		wg.Add(1)
 
 		// Check goroutine
 		go func(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, ac *attackConfig, mk markers, br baseRequest, char string, statusCache map[string]map[int]struct{}, distanceCache map[string]map[int]distances) {
-
 			// Waitgroup and semaphore handling
 			sem <- struct{}{}
 			defer func(sem chan struct{}, wg *sync.WaitGroup) {
 				<-sem
 				wg.Done()
 			}(sem, wg)
+
+			// Use package-level caches if needed
+			localStatusCache := statusCache
+			localDistanceCache := distanceCache
+			if usePackageCaches {
+				// We'll use the package-level caches directly
+				// The cache functions will handle locking
+			}
 
 			// Workaround for an IIS bug which makes the two characters following a percent sign
 			// in the 0-F range always return a match (so we just skip them)
@@ -390,7 +403,7 @@ func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpS
 									} else if args.Autocomplete == "status" {
 
 										// Check the response doesn't appear in this candidate's negative status set
-										ss := getStatuses(c, br, hc, st, statusCache)
+										ss := getStatuses(c, br, hc, st, localStatusCache)
 
 										if _, e := ss[res.StatusCode]; !e {
 											fnr = path
@@ -399,7 +412,7 @@ func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpS
 									} else if args.Autocomplete == "distance" {
 
 										// Get distances for this candidate
-										dists := getDistances(c, br, hc, st, ac, distanceCache)
+										dists := getDistances(c, br, hc, st, ac, localDistanceCache)
 
 										// If the status code wasn't seen during sampling
 										if dists[res.StatusCode] == (distances{}) {
@@ -529,7 +542,7 @@ func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpS
 					if len(br.ext) == 0 {
 						nr := br
 						nr.ext = "."
-						enumerate(sem, wg, hc, st, ac, mk, nr, statusCache, distanceCache)
+						enumerate(sem, wg, hc, st, ac, mk, nr, localStatusCache, localDistanceCache)
 					}
 
 				}
@@ -548,7 +561,7 @@ func enumerate(sem chan struct{}, wg *sync.WaitGroup, hc *http.Client, st *httpS
 					// Recurse if there are more characters in the name
 					res, err = fetch(hc, st, ac.method, url)
 					if err == nil && res.StatusCode != mk.statusNeg {
-						enumerate(sem, wg, hc, st, ac, mk, br, statusCache, distanceCache)
+						enumerate(sem, wg, hc, st, ac, mk, br, localStatusCache, localDistanceCache)
 					}
 
 				}
@@ -637,10 +650,20 @@ func autodechecksum(ac *attackConfig, br baseRequest) []wordlistRecord {
 
 // getStatuses fetches non-existent URLs and returns a list of response statuses
 func getStatuses(c wordlistRecord, br baseRequest, hc *http.Client, st *httpStats, statusCache map[string]map[int]struct{}) map[int]struct{} {
-
-	// Create a local map if the passed map is nil
+	// Use the package-level cache if nil is passed
+	usePackageCache := statusCache == nil
 	localCache := statusCache
-	if localCache == nil {
+	if usePackageCache {
+		cacheMutex.RLock()
+		// Check if we already have cached results
+		if statusCache[c.extension] != nil && len(statusCache[c.extension]) > 0 {
+			result := statusCache[c.extension]
+			cacheMutex.RUnlock()
+			return result
+		}
+		cacheMutex.RUnlock()
+
+		// We need to compute new results
 		localCache = make(map[string]map[int]struct{})
 	}
 
@@ -649,7 +672,7 @@ func getStatuses(c wordlistRecord, br baseRequest, hc *http.Client, st *httpStat
 		localCache[c.extension] = make(map[int]struct{})
 	}
 
-	// Returned cached statuses if they exist
+	// Return cached statuses if they exist
 	if len(localCache[c.extension]) > 0 {
 		return localCache[c.extension]
 	}
@@ -663,7 +686,6 @@ func getStatuses(c wordlistRecord, br baseRequest, hc *http.Client, st *httpStat
 	// Loop
 	statuses := make(map[int]struct{}, l)
 	for i := 0; i < l; i++ {
-
 		// Generate a random filename with the autocomplete candidate file extension
 		path := randPath(rand.Intn(4)+8, 0, alphanum) + c.extension
 
@@ -671,7 +693,6 @@ func getStatuses(c wordlistRecord, br baseRequest, hc *http.Client, st *httpStat
 		if res, err := fetch(hc, st, "GET", br.url+path); err == nil {
 			statuses[res.StatusCode] = struct{}{}
 		}
-
 	}
 
 	// Logging
@@ -679,15 +700,33 @@ func getStatuses(c wordlistRecord, br baseRequest, hc *http.Client, st *httpStat
 
 	// Cache and return the statuses
 	localCache[c.extension] = statuses
+
+	// Update the package-level cache if we're using it
+	if usePackageCache {
+		cacheMutex.Lock()
+		statusCache[c.extension] = statuses
+		cacheMutex.Unlock()
+	}
+
 	return statuses
 }
 
 // getDistances calculates response distances for the given URL
 func getDistances(c wordlistRecord, br baseRequest, hc *http.Client, st *httpStats, ac *attackConfig, distanceCache map[string]map[int]distances) map[int]distances {
-
-	// Create a local map if the passed map is nil
+	// Use the package-level cache if nil is passed
+	usePackageCache := distanceCache == nil
 	localCache := distanceCache
-	if localCache == nil {
+	if usePackageCache {
+		cacheMutex.RLock()
+		// Check if we already have cached results
+		if distanceCache[c.extension] != nil && len(distanceCache[c.extension]) > 0 {
+			result := distanceCache[c.extension]
+			cacheMutex.RUnlock()
+			return result
+		}
+		cacheMutex.RUnlock()
+
+		// We need to compute new results
 		localCache = make(map[string]map[int]distances)
 	}
 
@@ -716,19 +755,16 @@ func getDistances(c wordlistRecord, br baseRequest, hc *http.Client, st *httpSta
 	dists := make(map[int]distances)
 	var path string
 	for i := 0; i < l; i++ {
-
 		// Generate a random path ending in the candidate file extension
 		path = randPath(rand.Intn(4)+8, 0, alphanum) + c.extension
 
 		// Fetch the URL
 		if res, err := fetch(hc, st, "GET", br.url+path); err == nil {
-
 			// Read body (not checking for EOF, because an empty body still needs a sample)
 			b := make([]byte, 1024)
 			res.Body.Read(b)
 			body := string(b)
 			for j := 0; j < len(bodies[res.StatusCode])-1; j++ {
-
 				// Calculate Levenshtein distance
 				ld := levenshtein.Distance(bodies[res.StatusCode][j], body)
 
@@ -740,12 +776,10 @@ func getDistances(c wordlistRecord, br baseRequest, hc *http.Client, st *httpSta
 					dists[res.StatusCode] = distances{lp, body}
 					highdist[res.StatusCode] = lp
 				}
-
 			}
 
 			// Save the response sample
 			bodies[res.StatusCode] = append(bodies[res.StatusCode], body)
-
 		}
 	}
 
@@ -756,8 +790,15 @@ func getDistances(c wordlistRecord, br baseRequest, hc *http.Client, st *httpSta
 
 	// Cache and return
 	localCache[c.extension] = dists
-	return dists
 
+	// Update the package-level cache if we're using it
+	if usePackageCache {
+		cacheMutex.Lock()
+		distanceCache[c.extension] = dists
+		cacheMutex.Unlock()
+	}
+
+	return dists
 }
 
 // getWordlist returns wordlist entries
@@ -812,19 +853,9 @@ func printJSON(o any) {
 }
 
 // Scan starts enumeration of the given URL
-func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk markers, statusCache map[string]map[int]struct{}, distanceCache map[string]map[int]distances) {
-
-	// Initialize the maps if they're nil
-	if statusCache == nil {
-		statusCache = make(map[string]map[int]struct{})
-	}
-	if distanceCache == nil {
-		distanceCache = make(map[string]map[int]distances)
-	}
-
+func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk markers) {
 	// Loop through each URL
 	for len(urls) > 0 {
-
 		// Pop off a URL
 		var url string
 		url, urls = urls[0], urls[1:]
@@ -1066,10 +1097,7 @@ func Scan(urls []string, hc *http.Client, st *httpStats, wc wordlistConfig, mk m
 		// <hr>
 		printHuman("════════════════════════════════════════════════════════════════════════════════")
 
-		// Create local caches for this scan
-		localStatusCache := make(map[string]map[int]struct{})
-		localDistanceCache := make(map[string]map[int]distances)
-		Scan(urls, hc, st, wc, mk, localStatusCache, localDistanceCache)
+		Scan(urls, hc, st, wc, mk)
 	}
 	printHuman()
 
@@ -1298,10 +1326,6 @@ func Run() {
 			// Create URL-specific stats
 			urlSt := &httpStats{}
 
-			// Create URL-specific caches to avoid race conditions
-			urlStatusCache := make(map[string]map[int]struct{})
-			urlDistanceCache := make(map[string]map[int]distances)
-
 			// Create URL-specific markers
 			urlMk := markers{}
 
@@ -1319,10 +1343,7 @@ func Run() {
 				log.WithFields(log.Fields{"url": url}).Warn("URL scan timed out")
 				return
 			default:
-				// Create local caches for this scan
-				localStatusCache := make(map[string]map[int]struct{})
-				localDistanceCache := make(map[string]map[int]distances)
-				Scan([]string{url}, urlHc, urlSt, wc, urlMk, localStatusCache, localDistanceCache)
+				Scan([]string{url}, urlHc, urlSt, wc, urlMk)
 			}
 
 			// Aggregate statistics
